@@ -818,3 +818,197 @@ def test_31_draft_query_uses_live_state(client):
         assert r.status_code == 409
     finally:
         client.put(f"/api/fixtures/{par1_id}", json={"name": "Par1"})
+
+
+def _insert_legacy_plan(allocations, published_at, migration_count=0, used_lines=1) -> int:
+    """直接落库一条无快照的旧发布记录（模拟旧库遗留），返回 plan_id。
+
+    allocations: (fixture_id, line_id, start, end, migrated) 元组列表。
+    """
+    from app.database import SessionLocal
+    from app.models import Plan, PlanAllocation
+    from app.services import get_config_version
+
+    with SessionLocal() as db:
+        plan = Plan(
+            config_version=get_config_version(db),
+            status="published",
+            optimality_status="optimal",
+            migration_count=migration_count,
+            used_lines=used_lines,
+            published_at=published_at,
+        )
+        db.add(plan)
+        db.flush()
+        for fx_id, line_id, start, end, migrated in allocations:
+            db.add(
+                PlanAllocation(
+                    plan_id=plan.id, fixture_id=fx_id, line_id=line_id,
+                    start=start, end=end, migrated=migrated,
+                )
+            )
+        db.commit()
+        return plan.id
+
+
+def test_32_legacy_payload_field_source_adjudication(client):
+    """无快照旧记录逐项裁决：留存明细是事实，名称标来源，锁定/迁移起点/保留区标未知。"""
+    from datetime import datetime, timezone
+
+    fx = {f["name"]: f for f in client.get("/api/fixtures").json()}
+    spot1_id = fx["Spot1"]["id"]
+    mig_id = fx["Mig"]["id"]
+    legacy_id = _insert_legacy_plan(
+        [(spot1_id, 1, 1, 10, False), (mig_id, 2, 5, 24, True)],
+        datetime(2020, 2, 2, tzinfo=timezone.utc),
+        migration_count=1,
+        used_lines=2,
+    )
+
+    got = client.get(f"/api/plans/{legacy_id}").json()
+    assert got["status"] == "published"
+    assert got["from_snapshot"] is False
+    assert got["notice"]
+    fs = got["field_sources"]
+    assert fs["allocations"] == "publish_record"
+    assert fs["names"] == "current"
+    assert fs["locked"] == "unknown"
+    assert fs["migration_origin"] == "unknown"
+    assert fs["reservations"] == "unknown"
+
+    by_id = {a["fixture_id"]: a for a in got["allocations"]}
+    a1 = by_id[spot1_id]
+    # PlanAllocation 留存的线路/起止地址/迁移标记 = 发布时事实
+    assert (a1["line_id"], a1["start"], a1["end"], a1["channels"]) == (1, 1, 10, 10)
+    assert a1["migrated"] is False
+    # 当前名称标注来源；历史锁定为未知（null），不得写成 false
+    assert a1["name"] == "Spot1"
+    assert a1["name_source"] == "current"
+    assert a1["locked"] is None
+    assert a1["locked_source"] == "unknown"
+    assert by_id[mig_id]["migrated"] is True
+
+    # 迁移明细来自留存的迁移标记：去向是事实，起点无法还原
+    migs = got["migrations"]
+    assert len(migs) == 1
+    m = migs[0]
+    assert m["fixture_id"] == mig_id
+    assert m["from_line"] is None and m["from_start"] is None
+    assert (m["to_line"], m["to_start"]) == (2, 5)
+    assert m["locked"] is None
+
+    # 占用：灯具块是事实；保留区与含保留区的已用/空闲通道数标为未知
+    line2 = next(l for l in got["occupancy"] if l["line_id"] == 2)
+    assert line2["reservations"] is None
+    assert line2["reservations_source"] == "unknown"
+    assert line2["used_channels"] is None
+    assert line2["free_channels"] is None
+    assert line2["fixtures_used_channels"] == 20
+    assert [b["fixture_id"] for b in line2["fixtures"]] == [mig_id]
+    assert line2["fixtures"][0]["locked"] is None
+    assert line2["name_source"] == "current"
+    assert line2["is_active_source"] == "current"
+
+
+def test_33_legacy_payload_immune_to_current_drift(client):
+    """现状漂移后：事实字段不变，未知仍是未知（不随当前锁定漂移），名称仍标当前。"""
+    from datetime import datetime, timezone
+
+    fx = {f["name"]: f for f in client.get("/api/fixtures").json()}
+    spot1_id = fx["Spot1"]["id"]
+    legacy_id = _insert_legacy_plan(
+        [(spot1_id, 1, 20, 29, False)],
+        datetime(2020, 3, 3, tzinfo=timezone.utc),
+    )
+
+    # 现状漂移源：改名、切换锁定、新增保留区、线路重命名
+    assert client.put(f"/api/fixtures/{spot1_id}", json={"name": "Spot1Now"}).status_code == 200
+    assert client.put(f"/api/fixtures/{spot1_id}", json={"locked": True}).status_code == 200
+    assert client.post("/api/reservations",
+                       json={"line_id": 1, "start": 300, "end": 310, "reason": "drift"}).status_code == 201
+    assert client.patch("/api/lines/2", json={"name": "Universe-B"}).status_code == 200
+    try:
+        got = client.get(f"/api/plans/{legacy_id}").json()
+        a = got["allocations"][0]
+        # 事实字段不随现状漂移
+        assert (a["line_id"], a["start"], a["end"]) == (1, 20, 29)
+        assert a["migrated"] is False
+        # 历史锁定仍为未知——不得把当前 locked=True 当成发布时事实
+        assert a["locked"] is None
+        # 名称取当前值但标注来源
+        assert a["name"] == "Spot1Now"
+        assert a["name_source"] == "current"
+        # 保留区占用仍为未知——不随新增保留区漂移
+        line1 = next(l for l in got["occupancy"] if l["line_id"] == 1)
+        assert line1["reservations"] is None
+        assert line1["used_channels"] is None
+        assert line1["fixtures_used_channels"] == 10
+
+        # CSV 同步：锁定列写“未知”而非“是/否”，名称标注当前来源
+        csv_text = client.get(f"/api/plans/published/{legacy_id}/csv").content.decode("utf-8-sig")
+        row = next(r for r in csv_text.splitlines() if r.startswith(f"{spot1_id},"))
+        cells = row.split(",")
+        assert cells[1] == "Spot1Now（当前名称）"
+        assert cells[6] == "否"  # 是否迁移：留存标记是事实
+        assert cells[7] == "未知"  # 是否锁定：未知，不得写“是”或“否”
+    finally:
+        client.put(f"/api/fixtures/{spot1_id}", json={"name": "Spot1", "locked": False})
+        client.patch("/api/lines/2", json={"name": "线路 2"})
+
+
+def test_34_legacy_csv_columns_and_deleted_fixture(client):
+    """CSV 列保持不变；已删除灯具的名称标为不可用；迁移列仍取留存标记。"""
+    from datetime import datetime, timezone
+
+    fx = {f["name"]: f for f in client.get("/api/fixtures").json()}
+    spot1_id = fx["Spot1"]["id"]
+    mig_id = fx["Mig"]["id"]
+    legacy_id = _insert_legacy_plan(
+        [(spot1_id, 1, 1, 10, False), (mig_id, 2, 5, 24, True), (999999, 3, 1, 5, False)],
+        datetime(2020, 4, 4, tzinfo=timezone.utc),
+        migration_count=1,
+        used_lines=3,
+    )
+
+    # JSON：已删除灯具的名称标为不可用
+    got = client.get(f"/api/plans/{legacy_id}").json()
+    by_id = {a["fixture_id"]: a for a in got["allocations"]}
+    assert by_id[999999]["name"] == "#999999"
+    assert by_id[999999]["name_source"] == "unavailable"
+    assert by_id[999999]["locked"] is None
+
+    resp = client.get(f"/api/plans/published/{legacy_id}/csv")
+    assert resp.status_code == 200
+    assert resp.content.startswith(b"\xef\xbb\xbf")
+    lines = resp.content.decode("utf-8-sig").splitlines()
+    # 列与表头保持原样
+    assert lines[0] == "灯具ID,灯具名称,线路,起始地址,结束地址,通道数,是否迁移,是否锁定"
+    rows = {r.split(",")[0]: r.split(",") for r in lines[1:]}
+    assert rows[str(spot1_id)][1] == "Spot1（当前名称）"
+    assert rows[str(spot1_id)][6] == "否"
+    assert rows[str(spot1_id)][7] == "未知"
+    assert rows[str(mig_id)][6] == "是"  # 迁移标记是发布时事实
+    assert rows[str(mig_id)][7] == "未知"
+    assert rows["999999"][1] == "#999999（名称不可用）"
+    assert rows["999999"][7] == "未知"
+
+
+def test_35_latest_falls_back_when_latest_plan_has_no_snapshot(client):
+    """最近发布恰好是无快照旧记录时，published/latest 同样按字段来源裁决返回。"""
+    from datetime import datetime, timezone
+
+    fx = {f["name"]: f for f in client.get("/api/fixtures").json()}
+    spot1_id = fx["Spot1"]["id"]
+    legacy_id = _insert_legacy_plan(
+        [(spot1_id, 1, 1, 10, False)],
+        datetime(2099, 1, 1, tzinfo=timezone.utc),  # 确保成为最近发布
+    )
+
+    latest = client.get("/api/plans/published/latest").json()
+    assert latest["has_published"] is True
+    assert latest["plan_id"] == legacy_id
+    assert latest["from_snapshot"] is False
+    assert latest["notice"]
+    assert latest["field_sources"]["locked"] == "unknown"
+    assert latest["allocations"][0]["locked"] is None
+    assert latest["occupancy"][0]["reservations"] is None

@@ -550,28 +550,38 @@ async function loadPublished() {
   empty.classList.add("hidden");
   content.classList.remove("hidden");
   // 已发布地址表来自发布时的不可变快照：发布后改名、切换锁定、调整保留区
-  // 都不会改变此表与 CSV；仅旧库缺少快照的记录回退为按当前配置重建并提示。
+  // 都不会改变此表与 CSV；仅旧库缺少快照的记录按字段来源裁决重建并提示——
+  // 名称标注“当前名称”，无法还原的锁定状态显示“未知”而非“否”。
+  const legacy = data.from_snapshot === false;
   const when = new Date(data.published_at || data.created_at).toLocaleString("zh-CN");
   $("#published-meta").textContent =
     `发布 #${data.plan_id} · 配置 v${data.config_version} · ${when} · 迁移 ${data.migration_count} 台 · 启用 ${data.used_lines} 条线路`;
   const notice = $("#published-notice");
-  if (data.from_snapshot === false) {
+  if (legacy) {
     notice.textContent =
-      data.notice || "该发布记录缺少快照，以下内容按当前配置重建，可能与发布时不一致。";
+      data.notice || "该发布记录缺少快照：地址与迁移标记为发布时事实，名称为当前值，锁定/迁移起点/保留区占用未知。";
     notice.classList.remove("hidden");
   } else {
     notice.classList.add("hidden");
   }
   $("#btn-download-csv").href = `/api/plans/published/${data.plan_id}/csv`;
   $("#published-tbody").innerHTML = data.allocations
-    .map(
-      (a) => `
+    .map((a) => {
+      const nameSuffix =
+        a.name_source === "current"
+          ? ' <span class="muted">（当前名称）</span>'
+          : a.name_source === "unavailable"
+            ? ' <span class="muted">（名称不可用）</span>'
+            : "";
+      // locked 为 null 表示历史锁定状态无法还原：显示“未知”，不得当作未锁定
+      const lockedCell = a.locked === null || a.locked === undefined ? "未知" : a.locked ? "🔒" : "";
+      return `
     <tr>
-      <td>${a.fixture_id}</td><td>${esc(a.name)}</td>
+      <td>${a.fixture_id}</td><td>${esc(a.name)}${nameSuffix}</td>
       <td>${a.line_id}</td><td>${a.start}</td><td>${a.end}</td><td>${a.channels}</td>
-      <td>${a.migrated ? "🟠 是" : "否"}</td><td>${a.locked ? "🔒" : ""}</td>
-    </tr>`
-    )
+      <td>${a.migrated ? "🟠 是" : "否"}</td><td>${lockedCell}</td>
+    </tr>`;
+    })
     .join("");
 }
 

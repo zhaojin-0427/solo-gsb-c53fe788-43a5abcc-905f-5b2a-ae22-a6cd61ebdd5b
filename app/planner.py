@@ -256,6 +256,150 @@ def _occupancy_for(db: Session, allocs: list[PlanAllocation]) -> list[dict]:
     return out
 
 
+#: 无快照旧发布记录的字段来源裁决（随响应返回，供页面/调用方核对）
+LEGACY_FIELD_SOURCES = {
+    # PlanAllocation 留存的线路、起止地址与逐台迁移标记 = 发布时事实
+    "allocations": "publish_record",
+    # 灯具/线路名称取当前值，随改名漂移，仅标注来源后展示
+    "names": "current",
+    # 历史锁定状态无法还原 -> 未知（null），不得写成“否”
+    "locked": "unknown",
+    # 迁移起点（原线路/原地址）无法还原 -> 未知（null）
+    "migration_origin": "unknown",
+    # 发布时的保留区占用无法还原 -> 未知（null）
+    "reservations": "unknown",
+}
+
+LEGACY_NOTICE = (
+    "该发布记录缺少快照：线路、起止地址与是否迁移取自留存的方案明细，为发布时事实；"
+    "灯具/线路名称为当前值（已标注来源）；历史锁定状态、迁移起点与保留区占用无法还原，"
+    "已标为未知（null），不代表“否”或“无”。"
+)
+
+
+def _legacy_published_payload(db: Session, plan: Plan) -> dict:
+    """旧库缺少快照的发布记录：逐项裁决字段来源后重建。
+
+    - 发布时事实：PlanAllocation 留存的线路、起止地址、逐台迁移标记，
+      以及方案记录上的迁移台数、启用线路数、配置版本与发布时间；
+    - 当前值（标注 name_source/is_active_source）：灯具名称、线路名称与启停；
+    - 未知（None）：历史锁定状态、迁移起点、保留区占用及受其影响的
+      已用/空闲通道数——不得以当前值冒充，也不得写成“否”。
+    """
+    allocs = (
+        db.query(PlanAllocation)
+        .filter(PlanAllocation.plan_id == plan.id)
+        .order_by(PlanAllocation.fixture_id)
+        .all()
+    )
+    names = {f.id: f.name for f in db.query(Fixture).all()}
+
+    def _name_of(fixture_id: int) -> tuple[str, str]:
+        # 灯具已被删除时连当前名称也不可得，标为不可用
+        if fixture_id in names:
+            return names[fixture_id], "current"
+        return f"#{fixture_id}", "unavailable"
+
+    alloc_out = []
+    for a in allocs:
+        name, name_source = _name_of(a.fixture_id)
+        alloc_out.append(
+            {
+                "fixture_id": a.fixture_id,
+                "name": name,
+                "name_source": name_source,
+                "line_id": a.line_id,
+                "start": a.start,
+                "end": a.end,
+                "channels": a.end - a.start + 1,
+                "migrated": a.migrated,
+                "locked": None,
+                "locked_source": "unknown",
+            }
+        )
+    migrations = [
+        {
+            "fixture_id": a["fixture_id"],
+            "name": a["name"],
+            "name_source": a["name_source"],
+            # 迁移本身（migrated 标记）是事实，但起点已无法还原
+            "from_line": None,
+            "from_start": None,
+            "to_line": a["line_id"],
+            "to_start": a["start"],
+            "locked": None,
+        }
+        for a in alloc_out
+        if a["migrated"]
+    ]
+    return {
+        "feasible": True,
+        "id": plan.id,
+        "plan_id": plan.id,
+        "config_version": plan.config_version,
+        "status": plan.status,
+        "optimality_status": plan.optimality_status,
+        "migration_count": plan.migration_count,
+        "used_lines": plan.used_lines,
+        "created_at": plan.created_at,
+        "published_at": plan.published_at,
+        "from_snapshot": False,
+        "field_sources": dict(LEGACY_FIELD_SOURCES),
+        "notice": LEGACY_NOTICE,
+        "allocations": alloc_out,
+        "migrations": migrations,
+        "occupancy": _legacy_occupancy(db, alloc_out),
+        "conflicts": [],
+    }
+
+
+def _legacy_occupancy(db: Session, alloc_out: list[dict]) -> list[dict]:
+    """无快照发布记录的线路占用：灯具块为发布时事实，保留区占用标为未知。
+
+    已用/空闲通道数包含保留区占用，保留区无法还原时二者同样标为未知（None）；
+    另提供 fixtures_used_channels 表示仅由灯具块构成的事实部分。
+    """
+    lines = db.query(Line).order_by(Line.id).all()
+    blocks: dict[int, list[dict]] = {l.id: [] for l in lines}
+    for a in alloc_out:
+        if a["line_id"] not in blocks:
+            continue  # 留存明细引用了当前不存在的线路，无法定位展示
+        blocks[a["line_id"]].append(
+            {
+                "fixture_id": a["fixture_id"],
+                "name": a["name"],
+                "name_source": a["name_source"],
+                "start": a["start"],
+                "end": a["end"],
+                "channels": a["channels"],
+                "migrated": a["migrated"],
+                "locked": None,
+            }
+        )
+    out = []
+    for line in lines:
+        fx_blocks = sorted(blocks[line.id], key=lambda b: b["start"])
+        # 求解结果保证灯具块互不重叠，直接求和即为灯具占用通道数
+        used_by_fixtures = sum(b["channels"] for b in fx_blocks)
+        out.append(
+            {
+                "line_id": line.id,
+                "name": line.name,
+                "name_source": "current",
+                "is_active": line.is_active,
+                "is_active_source": "current",
+                "size": solver.LINE_SIZE,
+                "used_channels": None,
+                "free_channels": None,
+                "fixtures_used_channels": used_by_fixtures,
+                "fixtures": fx_blocks,
+                "reservations": None,
+                "reservations_source": "unknown",
+            }
+        )
+    return out
+
+
 def _latest_snapshot(db: Session, plan_id: int) -> PublishedSnapshot | None:
     return (
         db.query(PublishedSnapshot)
@@ -308,15 +452,10 @@ def get_plan_payload(db: Session, plan_id: int) -> dict:
         restored = _payload_from_snapshot(db, plan)
         if restored is not None:
             return restored
-        # 旧库缺少快照的发布记录：回退为按当前灯具/线路/保留区重建。
-        # 名称、锁定、迁移、占用已是当前状态而非发布时事实，必须显式
-        # 标注，不得伪装成历史快照。
-        payload = _plan_payload(db, plan, feasible=True)
-        payload["notice"] = (
-            "该发布记录缺少快照，以下内容按当前灯具、线路与保留区重建，"
-            "名称、锁定、迁移与占用信息可能与发布时不一致。"
-        )
-        return payload
+        # 旧库缺少快照的发布记录：逐项裁决字段来源——留存明细中的线路/
+        # 起止地址/迁移标记仍是发布时事实；名称取当前值并标注来源；历史
+        # 锁定、迁移起点与保留区占用标为未知，不得伪装成历史事实。
+        return _legacy_published_payload(db, plan)
     # 草稿/已作废：仍按当前预览路径实时重建
     return _plan_payload(db, plan, feasible=True)
 

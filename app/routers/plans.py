@@ -56,9 +56,24 @@ def published_csv(plan_id: int, db: Session = Depends(get_db)):
     plan = db.get(Plan, plan_id)
     if plan is None or plan.status != "published":
         raise HTTPException(status_code=404, detail="该方案尚未发布")
-    # 与已发布查询同一路径：优先从快照还原，旧库无快照时回退重建，
-    # 保证页面地址表与 CSV 内容一致
+    # 与已发布查询同一路径：优先从快照还原；旧库无快照时按字段来源裁决重建，
+    # 保证页面地址表与 CSV 内容一致——未知字段写“未知”，不得写成“否”
     payload = planner.get_plan_payload(db, plan_id)
+
+    def _name_cell(a: dict) -> str:
+        # 无快照旧记录的名称是当前值，须在 CSV 中标注来源（列保持不变）
+        src = a.get("name_source")
+        if src == "current":
+            return f"{a['name']}（当前名称）"
+        if src == "unavailable":
+            return f"{a['name']}（名称不可用）"
+        return a["name"]
+
+    def _locked_cell(a: dict) -> str:
+        # 历史锁定状态无法还原时为 None：写“未知”而非“否”
+        if a.get("locked") is None:
+            return "未知"
+        return "是" if a["locked"] else "否"
 
     buf = io.StringIO()
     buf.write("﻿")
@@ -68,13 +83,13 @@ def published_csv(plan_id: int, db: Session = Depends(get_db)):
         writer.writerow(
             [
                 a["fixture_id"],
-                a["name"],
+                _name_cell(a),
                 a["line_id"],
                 a["start"],
                 a["end"],
                 a["channels"],
                 "是" if a["migrated"] else "否",
-                "是" if a["locked"] else "否",
+                _locked_cell(a),
             ]
         )
     buf.seek(0)
