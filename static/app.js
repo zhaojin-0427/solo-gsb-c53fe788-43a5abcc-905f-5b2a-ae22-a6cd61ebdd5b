@@ -538,6 +538,94 @@ $("#btn-publish").addEventListener("click", async () => {
 });
 
 // ---------- 已发布 ----------
+function lockText(locked) {
+  // 快照记录为明确的 true/false；旧记录无快照时为 null（未知），不得显示成“否”
+  return locked === true ? "🔒 是" : locked === false ? "否" : "❓ 未知";
+}
+
+function nameCell(name, source) {
+  // current：名称来自当前数据库，只是现值而非发布时名称；unknown：灯具已删除
+  const tag = source === "current"
+    ? ' <span class="src-tag src-current" title="该名称为当前名称，发布时名称无法还原">当前名称</span>'
+    : source === "unknown"
+      ? ' <span class="src-tag src-unknown" title="灯具已删除，发布时名称不可用">名称不可用</span>'
+      : "";
+  return `${esc(name)}${tag}`;
+}
+
+function publishedTracks(occupancy) {
+  const pct = (addr) => `calc(${(addr - 1) / 512 * 100}%)`;
+  const widthPct = (a, b) => `calc(${(b - a + 1) / 512 * 100}%)`;
+  $("#published-tracks").innerHTML = occupancy
+    .map((line) => {
+      const lineNameTag = line.name_source === "current"
+        ? ' <span class="src-tag src-current" title="线路名称为当前名称">当前名称</span>'
+        : line.name_source === "unknown"
+          ? ' <span class="src-tag src-unknown">名称不可用</span>'
+          : "";
+      const resNote = line.reservations === null
+        ? '<span class="muted">发布时保留区占用：❓不可用</span>'
+        : line.reservations.length
+          ? line.reservations
+              .map((r) => `<span class="muted">保留区 #${r.id}（${r.start}-${r.end} ${esc(r.reason)}）</span>`)
+              .join(" ")
+          : '<span class="muted">发布时保留区：无</span>';
+      const resBlocks = Array.isArray(line.reservations)
+        ? line.reservations
+            .map(
+              (r) =>
+                `<div class="block reserved" style="left:${pct(r.start)};width:${widthPct(r.start, r.end)}"
+                  title="保留区 #${r.id}：${r.start}-${r.end} ${esc(r.reason)}">保 #${r.id}</div>`
+            )
+            .join("")
+        : "";
+      const fxBlocks = (line.fixtures || [])
+        .map((f) => {
+          const cls = f.locked === true ? "locked" : f.migrated ? "migrated" : "fixture";
+          return `<div class="block ${cls}" style="left:${pct(f.start)};width:${widthPct(f.start, f.end)}"
+            title="#${f.fixture_id} ${esc(f.name)}：${f.start}-${f.end}（${f.channels}ch）${f.locked === true ? " 🔒锁定" : f.migrated ? " 迁移" : ""}">
+            ${f.channels >= 14 ? esc(f.name) : f.fixture_id}</div>`;
+        })
+        .join("");
+      const usedNote = line.used_channels === null
+        ? `灯具占用 ${line.fixture_channels ?? "?"}/512，总占用/空闲 ❓未知（历史保留区不可还原）`
+        : `已用 ${line.used_channels}/512，空闲 ${line.free_channels}`;
+      return `
+      <div class="track ${line.is_active === false ? "disabled" : ""}">
+        <div class="track-head">
+          <strong>线路 ${line.line_id} · ${esc(line.name)}</strong>${lineNameTag}${line.is_active === false ? "（当前已停用）" : ""}
+          <span class="muted">${usedNote}</span>
+        </div>
+        <div class="track-bar">${resBlocks + fxBlocks}</div>
+        <div class="track-scale"><span>1</span><span>128</span><span>256</span><span>384</span><span>512</span></div>
+        <div class="track-res">${resNote}</div>
+      </div>`;
+    })
+    .join("");
+}
+
+function renderPublishedMigrations(migrations) {
+  const panel = $("#published-migration-panel");
+  $("#published-migration-count").textContent = migrations.length;
+  if (!migrations.length) {
+    panel.classList.add("hidden");
+    return;
+  }
+  panel.classList.remove("hidden");
+  $("#published-migration-tbody").innerHTML = migrations
+    .map(
+      (m) => `
+    <tr>
+      <td>${m.fixture_id}</td><td>${nameCell(m.name, m.name_source)}</td>
+      <td>${m.from_line ?? "❓未知"}</td><td>${m.from_start ?? "❓未知"}</td>
+      <td>➡️</td>
+      <td>${m.to_line}</td><td>${m.to_start}</td>
+      <td>${lockText(m.locked)}</td>
+    </tr>`
+    )
+    .join("");
+}
+
 async function loadPublished() {
   const data = await api("/api/plans/published/latest");
   const empty = $("#published-empty");
@@ -549,27 +637,30 @@ async function loadPublished() {
   }
   empty.classList.add("hidden");
   content.classList.remove("hidden");
-  // 已发布地址表来自发布时的不可变快照：发布后改名、切换锁定、调整保留区
-  // 都不会改变此表与 CSV；仅旧库缺少快照的记录回退为按当前配置重建并提示。
+  const legacy = data.from_snapshot === false;
   const when = new Date(data.published_at || data.created_at).toLocaleString("zh-CN");
   $("#published-meta").textContent =
-    `发布 #${data.plan_id} · 配置 v${data.config_version} · ${when} · 迁移 ${data.migration_count} 台 · 启用 ${data.used_lines} 条线路`;
+    `发布 #${data.plan_id} · 配置 v${data.config_version} · ${when} · 迁移 ${data.migration_count} 台 · 启用 ${data.used_lines} 条线路` +
+    (legacy ? " · ⚠️ 无快照的旧记录" : " · 来自发布快照");
   const notice = $("#published-notice");
-  if (data.from_snapshot === false) {
+  if (legacy) {
     notice.textContent =
-      data.notice || "该发布记录缺少快照，以下内容按当前配置重建，可能与发布时不一致。";
+      data.notice || "该发布记录缺少快照，部分发布时字段无法还原，已按字段来源分别标注。";
     notice.classList.remove("hidden");
   } else {
     notice.classList.add("hidden");
   }
+  $("#published-fields").classList.toggle("hidden", !legacy);
   $("#btn-download-csv").href = `/api/plans/published/${data.plan_id}/csv`;
+  publishedTracks(data.occupancy || []);
+  renderPublishedMigrations(data.migrations || []);
   $("#published-tbody").innerHTML = data.allocations
     .map(
       (a) => `
     <tr>
-      <td>${a.fixture_id}</td><td>${esc(a.name)}</td>
+      <td>${a.fixture_id}</td><td>${legacy ? nameCell(a.name, a.name_source) : esc(a.name)}</td>
       <td>${a.line_id}</td><td>${a.start}</td><td>${a.end}</td><td>${a.channels}</td>
-      <td>${a.migrated ? "🟠 是" : "否"}</td><td>${a.locked ? "🔒" : ""}</td>
+      <td>${a.migrated ? "🟠 是" : "否"}</td><td>${legacy ? lockText(a.locked) : a.locked ? "🔒 是" : "否"}</td>
     </tr>`
     )
     .join("");

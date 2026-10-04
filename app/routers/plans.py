@@ -65,16 +65,20 @@ def published_csv(plan_id: int, db: Session = Depends(get_db)):
     writer = csv.writer(buf)
     writer.writerow(["灯具ID", "灯具名称", "线路", "起始地址", "结束地址", "通道数", "是否迁移", "是否锁定"])
     for a in payload["allocations"]:
+        # 列结构保持不变；来源不明的字段写“未知”，绝不用当前值顶替成“否”。
+        name = a["name"]
+        if a.get("name_source") == "current":
+            name = f"{name}（当前名称，发布时名称未知）"
         writer.writerow(
             [
                 a["fixture_id"],
-                a["name"],
+                name,
                 a["line_id"],
                 a["start"],
                 a["end"],
                 a["channels"],
                 "是" if a["migrated"] else "否",
-                "是" if a["locked"] else "否",
+                "是" if a["locked"] is True else "否" if a["locked"] is False else "未知",
             ]
         )
     buf.seek(0)

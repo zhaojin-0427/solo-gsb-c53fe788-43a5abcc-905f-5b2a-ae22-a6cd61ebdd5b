@@ -137,6 +137,21 @@
           <a id="btn-download-csv" class="button-like" download>⬇ 下载已发布地址表 CSV</a>
         </div>
         <div id="published-notice" class="banner warn hidden"></div>
+        <div id="published-fields" class="field-legend muted hidden">
+          字段来源：<strong>发布时记录</strong>＝线路 / 起止地址 / 逐台迁移标记；
+          <strong>当前名称</strong>＝灯具与线路的现名（发布时名称已不可考）；
+          <strong>未知</strong>＝发布时锁定、迁移起点与保留区占用无法还原。
+        </div>
+        <h2>线路占用</h2>
+        <div id="published-tracks"></div>
+        <div id="published-migration-panel" class="hidden">
+          <h2>迁移清单 <span id="published-migration-count" class="count"></span></h2>
+          <table class="data">
+            <thead><tr><th>灯具ID</th><th>名称</th><th>原线路</th><th>原地址</th><th></th><th>新线路</th><th>新地址</th><th>锁定</th></tr></thead>
+            <tbody id="published-migration-tbody"></tbody>
+          </table>
+        </div>
+        <h2>已发布地址表</h2>
         <table class="data">
           <thead><tr><th>灯具ID</th><th>名称</th><th>线路</th><th>起始</th><th>结束</th><th>通道数</th><th>迁移</th><th>锁定</th></tr></thead>
           <tbody id="published-tbody"></tbody>

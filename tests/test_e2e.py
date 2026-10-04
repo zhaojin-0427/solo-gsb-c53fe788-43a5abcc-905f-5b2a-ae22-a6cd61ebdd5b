@@ -1,6 +1,8 @@
 """端到端测试：型录导入、编排、版本失效发布、CSV 导出与冲突诊断。"""
 from __future__ import annotations
 
+import csv
+import io
 import os
 import tempfile
 
@@ -211,6 +213,25 @@ def test_13_deterministic_lexicographic_tiebreak():
     # 三台 10ch 都能放线路 1，字典序最小 => 全部 line 1，起始 1/11/21
     assert keys1 == [(1, 1), (1, 11), (1, 21)]
     assert r1.optimality == "optimal"
+
+
+def test_13b_lex_break_is_stable_across_repeated_solves():
+    """字典序破局在重复求解（含跨批边界）下必须稳定：曾因多 worker 并行把
+    非最优 incumbent 误报 OPTIMAL，出现相邻灯具地址交换。"""
+    from app.solver import FixtureSpec, LineSpec, SolveSpec, solve
+
+    spec = SolveSpec(
+        fixtures=[FixtureSpec(i, f"F{i}", 10, None, None, False) for i in range(1, 61)],
+        reservations=[],
+        lines=[LineSpec(i, f"L{i}", True) for i in range(1, 5)],
+    )
+    expected = {i: (1, (i - 1) * 10 + 1) for i in range(1, 52)}
+    for _ in range(10):
+        r = solve(spec)
+        assert r.optimality == "optimal"
+        by_id = {a.fixture_id: (a.line_id, a.start) for a in r.allocations}
+        assert {i: by_id[i] for i in range(1, 52)} == expected
+        assert by_id[52] == (2, 1)
 
 
 def test_14_lexicographic_requires_second_line():
@@ -796,6 +817,156 @@ def test_30_legacy_published_without_snapshot_falls_back(client):
     # latest 仍是真正最近发布的方案
     latest = client.get("/api/plans/published/latest").json()
     assert latest["plan_id"] != legacy_id
+
+
+def test_32_legacy_published_field_sources_adjudicated(client):
+    """无快照旧记录：逐项裁决字段来源，当前锁定/保留区/迁移起点不得伪装成发布时事实。"""
+    from datetime import datetime, timezone
+
+    from app.database import SessionLocal
+    from app.models import Plan, PlanAllocation
+    from app.services import get_config_version
+
+    latest_plan_id = client.get("/api/plans/published/latest").json()["plan_id"]
+    fixtures = {f["id"]: f for f in client.get("/api/fixtures").json()}
+    fx1 = sorted(fixtures.values(), key=lambda f: f["id"])[0]  # 现存灯具
+    fx2 = sorted(fixtures.values(), key=lambda f: f["id"])[1]
+
+    # 制造漂移源：当前锁定切换、保留区变化，都不应进入旧记录的发布时字段
+    assert client.put(f"/api/fixtures/{fx1['id']}",
+                      json={"previous_line": 2, "previous_start": 200, "locked": True}).status_code == 200
+    assert client.post("/api/reservations",
+                       json={"line_id": 1, "start": 300, "end": 310, "reason": "current-only"}).status_code == 201
+    current_fx1_name = fx1["name"]  # 发布时名称不可考，只能呈现当前名称并标来源
+
+    with SessionLocal() as db:
+        plan = Plan(
+            config_version=get_config_version(db),
+            status="published",
+            optimality_status="optimal",
+            migration_count=1,
+            used_lines=1,
+            published_at=datetime(2020, 1, 2, tzinfo=timezone.utc),  # 不抢占 latest
+        )
+        db.add(plan)
+        db.flush()
+        db.add(PlanAllocation(plan_id=plan.id, fixture_id=fx1["id"],
+                              line_id=1, start=10, end=19, migrated=False))
+        db.add(PlanAllocation(plan_id=plan.id, fixture_id=fx2["id"],
+                              line_id=1, start=20, end=39, migrated=True))
+        db.commit()
+        legacy_id = plan.id
+
+    got = client.get(f"/api/plans/{legacy_id}").json()
+    assert got["from_snapshot"] is False
+    assert got["notice"]
+    by_fx = {a["fixture_id"]: a for a in got["allocations"]}
+
+    # 留存的线路/起止地址/逐台迁移标记仍是发布时事实
+    a1 = by_fx[fx1["id"]]
+    assert (a1["line_id"], a1["start"], a1["end"]) == (1, 10, 19)
+    assert a1["line_id"] == 1 and a1["migrated"] is False
+    assert a1["line_id_source"] == "plan" and a1["migrated_source"] == "plan"
+    # 当前名称如实呈现但必须标明来源；不得当作发布时名称
+    assert a1["name"] == current_fx1_name and a1["name_source"] == "current"
+    # 当前锁定为 True，但发布时锁定无法还原 -> None/unknown，绝不是 False 更不是 True
+    assert a1["locked"] is None and a1["locked_source"] == "unknown"
+
+    a2 = by_fx[fx2["id"]]
+    assert a2["migrated"] is True and a2["migrated_source"] == "plan"
+    assert a2["locked"] is None and a2["locked_source"] == "unknown"
+
+    # 迁移明细：保留“发生过迁移”与发布时落点，起点不可还原必须标未知，不随当前既有地址漂移
+    mig = got["migrations"]
+    assert len(mig) == 1
+    m = mig[0]
+    assert m["fixture_id"] == fx2["id"]
+    assert (m["to_line"], m["to_start"]) == (1, 20) and m["to_source"] == "plan"
+    assert m["from_line"] is None and m["from_start"] is None and m["from_source"] == "unknown"
+    assert m["locked"] is None and m["locked_source"] == "unknown"
+
+    # 占用：不并入当前保留区，历史保留区占用不可用，总量未知
+    line1 = next(l for l in got["occupancy"] if l["line_id"] == 1)
+    assert line1["reservations"] is None and line1["reservations_source"] == "unknown"
+    assert line1["used_channels"] is None and line1["free_channels"] is None
+    assert line1["fixture_channels"] == 30  # 仅留存区间可重算：1-19 与 20-39
+    assert line1["name_source"] == "current"
+
+    # 恢复 fx1，避免污染后续用例
+    assert client.put(f"/api/fixtures/{fx1['id']}", json={"locked": False}).status_code == 200
+
+    # latest 仍不受影响
+    latest = client.get("/api/plans/published/latest").json()
+    assert latest["plan_id"] == latest_plan_id
+
+
+def test_33_legacy_csv_unknown_not_false(client):
+    """旧记录 CSV：锁定列写“未知”而非“否”；名称标明为当前名称；迁移列仍是发布时事实。"""
+    from datetime import datetime, timezone
+
+    from app.database import SessionLocal
+    from app.models import Plan, PlanAllocation
+    from app.services import get_config_version
+
+    fixtures = sorted(client.get("/api/fixtures").json(), key=lambda f: f["id"])
+    fx1, fx2 = fixtures[0], fixtures[1]
+
+    with SessionLocal() as db:
+        plan = Plan(
+            config_version=get_config_version(db),
+            status="published",
+            optimality_status="optimal",
+            migration_count=1,
+            used_lines=1,
+            published_at=datetime(2020, 1, 3, tzinfo=timezone.utc),
+        )
+        db.add(plan)
+        db.flush()
+        db.add(PlanAllocation(plan_id=plan.id, fixture_id=fx1["id"],
+                              line_id=1, start=10, end=19, migrated=False))
+        db.add(PlanAllocation(plan_id=plan.id, fixture_id=fx2["id"],
+                              line_id=1, start=20, end=39, migrated=True))
+        db.commit()
+        legacy_id = plan.id
+
+    text = client.get(f"/api/plans/published/{legacy_id}/csv").content.decode("utf-8-sig")
+    rows = list(csv.reader(io.StringIO(text)))
+    assert rows[0] == ["灯具ID", "灯具名称", "线路", "起始地址", "结束地址", "通道数", "是否迁移", "是否锁定"]
+    by_fx = {int(r[0]): r for r in rows[1:]}
+    r1, r2 = by_fx[fx1["id"]], by_fx[fx2["id"]]
+    assert r1[7] == "未知"  # 历史锁定不可还原，不能写成“否”
+    assert r2[7] == "未知"
+    assert r1[6] == "否" and r2[6] == "是"  # 逐台迁移标记是留存事实
+    assert "当前名称" in r1[1]  # 现值名称标明来源
+    # 列结构不变
+    assert all(len(r) == 8 for r in rows)
+
+
+def test_34_legacy_snapshot_records_unchanged(client):
+    """有快照的发布结果不受来源裁决影响：字段仍为 bool、无 *_source 标注。"""
+    import io as _io
+    import csv as _csv
+
+    p = client.post("/api/plans/preview").json()
+    assert p["optimality_status"] == "optimal"
+    r = client.post(f"/api/plans/{p['plan_id']}/publish")
+    assert r.status_code == 200, r.text
+    plan_id = p["plan_id"]
+
+    got = client.get(f"/api/plans/{plan_id}").json()
+    assert got["from_snapshot"] is True
+    assert "notice" not in got
+    for a in got["allocations"]:
+        assert isinstance(a["locked"], bool)
+        assert isinstance(a["migrated"], bool)
+        assert "name_source" not in a and "locked_source" not in a
+    for line in got["occupancy"]:
+        assert isinstance(line["used_channels"], int)
+
+    text = client.get(f"/api/plans/published/{plan_id}/csv").content.decode("utf-8-sig")
+    rows = list(_csv.reader(_io.StringIO(text)))
+    assert all(r[7] in ("是", "否") for r in rows[1:])
+    assert all("当前名称" not in r[1] for r in rows[1:])
 
 
 def test_31_draft_query_uses_live_state(client):

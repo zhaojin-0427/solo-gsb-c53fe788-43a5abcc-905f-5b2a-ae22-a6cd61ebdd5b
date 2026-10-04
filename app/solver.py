@@ -75,10 +75,13 @@ _UNPROVEN_NO_CANDIDATE_MESSAGES = {
 }
 
 
-def _params(seconds: float, *, first_solution: bool = False) -> cp_model.sat_parameters_pb2.SatParameters:
+def _params(seconds: float, *, first_solution: bool = False, workers: int | None = None) -> cp_model.sat_parameters_pb2.SatParameters:
     p = cp_model.sat_parameters_pb2.SatParameters()
     p.max_time_in_seconds = seconds
-    p.num_search_workers = 8
+    # 多 worker 并行搜索在字典序破局阶段可能把非最优 incumbent 误报为 OPTIMAL
+    # （加权目标含跨灯具的大权重时观察到非确定性结果）；需要逐台固定取值的
+    # 阶段显式使用单 worker 以保证结论可靠。
+    p.num_search_workers = workers if workers is not None else 8
     p.log_search_progress = False
     if first_solution:
         # 只需要证明可行并拿到一个解时，尽快返回（不追求最优）
@@ -599,8 +602,14 @@ def _lexicographic_phase(spec, sorted_fixtures, line_ids, min_mig, min_used):
             terms = _packed_terms(art, batch, line_ids, batch_size)
             model.Minimize(terms)
             solver = cp_model.CpSolver()
+            # 字典序目标是跨灯具加权的：多 worker 并行曾把非最优 incumbent
+            # 误报为 OPTIMAL，导致固定下错误的（线路, 地址）。逐台固定必须
+            # 可信，此阶段强制单 worker（规模小，速度不受影响）。
             solver.parameters.CopyFrom(
-                _params(SOLVE_SECONDS_PHASE if batch_size > 1 else SOLVE_SECONDS_TIE)
+                _params(
+                    SOLVE_SECONDS_PHASE if batch_size > 1 else SOLVE_SECONDS_TIE,
+                    workers=1,
+                )
             )
             st = solver.Solve(model)
             if st == cp_model.INFEASIBLE:

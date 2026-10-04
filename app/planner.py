@@ -308,17 +308,145 @@ def get_plan_payload(db: Session, plan_id: int) -> dict:
         restored = _payload_from_snapshot(db, plan)
         if restored is not None:
             return restored
-        # 旧库缺少快照的发布记录：回退为按当前灯具/线路/保留区重建。
-        # 名称、锁定、迁移、占用已是当前状态而非发布时事实，必须显式
-        # 标注，不得伪装成历史快照。
-        payload = _plan_payload(db, plan, feasible=True)
-        payload["notice"] = (
-            "该发布记录缺少快照，以下内容按当前灯具、线路与保留区重建，"
-            "名称、锁定、迁移与占用信息可能与发布时不一致。"
-        )
-        return payload
+        # 旧库缺少快照的发布记录：逐项裁决字段来源，绝不把当前状态伪装成发布时事实
+        return _legacy_published_payload(db, plan)
     # 草稿/已作废：仍按当前预览路径实时重建
     return _plan_payload(db, plan, feasible=True)
+
+
+# 字段来源标记：
+#   plan     —— PlanAllocation / Plan 留存的发布时事实（线路、起止地址、逐台迁移标记）
+#   current  —— 只能取当前数据库的现值（名称、线路名称、停用状态），已标明来源
+#   unknown  —— 历史值无法还原，显式标为未知，不得回退为 False/“否”
+SOURCE_PLAN = "plan"
+SOURCE_CURRENT = "current"
+SOURCE_UNKNOWN = "unknown"
+
+LEGACY_NOTICE = (
+    "该发布记录缺少快照：线路、起止地址与逐台迁移标记取自发布时留存的分配记录；"
+    "灯具名称与线路名称为当前数据库中的名称（可能已被改名）；"
+    "发布时的锁定状态、各迁移灯具的原线路/原地址以及保留区占用无法还原，已标为“未知/不可用”。"
+)
+
+
+def _fixture_name_source(fixtures: dict[int, Fixture], fixture_id: int) -> tuple[str, str]:
+    """返回 (名称, 名称来源)：灯具仍存在则为当前名称，已删除则名称与来源均不可还原。"""
+    fx = fixtures.get(fixture_id)
+    if fx is None:
+        return f"#{fixture_id}（灯具已删除，名称不可用）", SOURCE_UNKNOWN
+    return fx.name, SOURCE_CURRENT
+
+
+def _legacy_published_payload(db: Session, plan: Plan) -> dict:
+    """旧库无快照发布记录的字段来源裁决结果。
+
+    - 线路、起止地址、逐台迁移标记：PlanAllocation 留存，仍是发布时事实；
+    - 名称：只能取当前值，逐条以 name_source=current 标明；灯具已删除则不可用；
+    - 发布时锁定：无任何留存，locked=None、locked_source=unknown，不得用当前锁定顶替；
+    - 迁移起点（from_line/from_start）：无留存且发布回写会覆盖既有地址，
+      逐条置 None 并标 unknown；迁移清单只保留迁移事实本身（逐台迁移标记 + 新地址）；
+    - 占用：通道占用可由留存的分配区间重算，但保留区占用、线路名称/启停为历史未知，
+      used_channels/free_channels 置 None，reservations 不可用，绝不拿当前保留区凑数。
+    """
+    allocs = (
+        db.query(PlanAllocation)
+        .filter(PlanAllocation.plan_id == plan.id)
+        .order_by(PlanAllocation.fixture_id)
+        .all()
+    )
+    fixtures = {f.id: f for f in db.query(Fixture).all()}
+    lines = {l.id: l for l in db.query(Line).all()}
+
+    alloc_out: list[dict] = []
+    for a in allocs:
+        name, name_source = _fixture_name_source(fixtures, a.fixture_id)
+        alloc_out.append(
+            {
+                "fixture_id": a.fixture_id,
+                "name": name,
+                "name_source": name_source,
+                "line_id": a.line_id,
+                "line_id_source": SOURCE_PLAN,
+                "start": a.start,
+                "end": a.end,
+                "channels": a.end - a.start + 1,
+                "migrated": a.migrated,
+                "migrated_source": SOURCE_PLAN,
+                # 历史锁定无法还原：None 表示未知，区别于明确的 True/False
+                "locked": None,
+                "locked_source": SOURCE_UNKNOWN,
+            }
+        )
+
+    migrations: list[dict] = []
+    for a in alloc_out:
+        if not a["migrated"]:
+            continue
+        migrations.append(
+            {
+                "fixture_id": a["fixture_id"],
+                "name": a["name"],
+                "name_source": a["name_source"],
+                # 发布时的迁移起点没有任何留存（发布回写还会覆盖既有地址），不可还原
+                "from_line": None,
+                "from_start": None,
+                "from_source": SOURCE_UNKNOWN,
+                # 迁移后的落点就是分配记录里的地址，属发布时事实
+                "to_line": a["line_id"],
+                "to_start": a["start"],
+                "to_source": SOURCE_PLAN,
+                "locked": None,
+                "locked_source": SOURCE_UNKNOWN,
+            }
+        )
+
+    occupancy: list[dict] = []
+    blocks: dict[int, list[dict]] = {a.line_id: [] for a in allocs}
+    for a in alloc_out:
+        blocks[a["line_id"]].append(a)
+    for line_id in sorted({a.line_id for a in allocs} | set(lines)):
+        line = lines.get(line_id)
+        line_blocks = sorted(blocks.get(line_id, []), key=lambda b: b["start"])
+        fixture_channels = set()
+        for b in line_blocks:
+            fixture_channels.update(range(b["start"], b["end"] + 1))
+        occupancy.append(
+            {
+                "line_id": line_id,
+                "name": line.name if line is not None else f"线路 {line_id}（线路已删除，名称不可用）",
+                "name_source": SOURCE_CURRENT if line is not None else SOURCE_UNKNOWN,
+                "is_active": line.is_active if line is not None else None,
+                "is_active_source": SOURCE_CURRENT if line is not None else SOURCE_UNKNOWN,
+                "size": solver.LINE_SIZE,
+                # 历史保留区占用无法还原，无法给出发布时的总占用/空闲
+                "used_channels": None,
+                "free_channels": None,
+                "channels_source": SOURCE_UNKNOWN,
+                "fixture_channels": len(fixture_channels),
+                "fixtures": line_blocks,
+                "reservations": None,
+                "reservations_source": SOURCE_UNKNOWN,
+            }
+        )
+
+    return {
+        "feasible": True,
+        "id": plan.id,
+        "plan_id": plan.id,
+        "config_version": plan.config_version,
+        "status": plan.status,
+        "optimality_status": plan.optimality_status,
+        "migration_count": plan.migration_count,
+        "used_lines": plan.used_lines,
+        "created_at": plan.created_at,
+        "published_at": plan.published_at,
+        "from_snapshot": False,
+        "notice": LEGACY_NOTICE,
+        "allocations": alloc_out,
+        "migrations": migrations,
+        "occupancy": occupancy,
+        "conflicts": [],
+    }
 
 
 def latest_published(db: Session) -> Plan | None:
